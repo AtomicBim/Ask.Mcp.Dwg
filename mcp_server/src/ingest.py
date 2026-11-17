@@ -39,7 +39,8 @@ except Exception:
 log = logging.getLogger("ingest")
 
 __all__ = ["SourcePdf", "Sheet", "Project", "build_project", "sheet_tables", "Bm25",
-           "page_lines", "parse_stamp",
+           "page_lines", "parse_stamp", "build_sheets", "finalize_project",
+           "page_tables_md", "find_page_tables",
            "KIND_TITLE", "KIND_OD", "KIND_DWG", "KIND_NODE", "KIND_SPEC",
            "KIND_LIST", "KIND_ANNEX", "KIND_SCAN", "KIND_OTHER"]
 
@@ -99,6 +100,7 @@ NOTES_CAP = 2500
 TABLES_MAX = 12
 TABLE_MD_CAP = 3000
 TABLE_MIN_ROWS, TABLE_MIN_COLS, TABLE_MIN_FILL = 3, 2, 0.12
+TABLE_PREFILTER_MIN_WORDS = int(os.getenv("TABLE_PREFILTER_MIN_WORDS", "8"))
 
 # качество текстового слоя: битые шрифты без ToUnicode дают «("() ## + / (-»
 TEXT_MIN_CHARS = 40
@@ -617,22 +619,61 @@ def _find_tables(page, clip: Optional[fitz.Rect]):
         return page.find_tables(**kw)
 
 
+def table_clip(page, lines: Optional[Sequence[Line]] = None) -> Optional[fitz.Rect]:
+    """Область выше штампа (в неповёрнутой системе) или None, если штамп не найден."""
+    if lines is None:
+        lines, _ = page_lines(page)
+    top = _stamp_top(page, lines, parse_stamp(page, lines)["code"])
+    if top is not None and top > page.rect.y0 + 20:
+        pr = page.rect
+        return fitz.Rect(pr.x0, pr.y0, pr.x1, top) * page.derotation_matrix
+    return None
+
+
+def has_table_text(page, clip: Optional[fitz.Rect]) -> bool:
+    """Префильтр: на пустом бланке (сетка без текста) find_tables бессмыслен и стоит
+    десятки секунд. Слов меньше TABLE_PREFILTER_MIN_WORDS -> таблицы не ищем."""
+    if TABLE_PREFILTER_MIN_WORDS <= 0:
+        return True
+    try:
+        words = page.get_text("words", clip=clip) if clip is not None else page.get_text("words")
+    except Exception:
+        return True
+    return len(words) >= TABLE_PREFILTER_MIN_WORDS
+
+
+def find_page_tables(page, lines: Optional[Sequence[Line]] = None):
+    """Общий поиск таблиц страницы: clip выше штампа, затем (если пусто) весь лист.
+    Оба вызова find_tables отсекаются префильтром. -> (tables, empty_grid_skipped)."""
+    clip = table_clip(page, lines)
+    if not has_table_text(page, clip):
+        return [], True
+    tabs = list(getattr(_find_tables(page, clip), "tables", []) or [])
+    if not tabs and clip is not None:
+        if not has_table_text(page, None):
+            return [], True
+        tabs = list(getattr(_find_tables(page, None), "tables", []) or [])
+    return tabs, False
+
+
 def sheet_tables(pdf: bytes, page_index: int) -> List[str]:
+    """Открывает PDF из bytes (CLI/совместимость)."""
+    doc = fitz.open(stream=pdf, filetype="pdf")
+    try:
+        return page_tables_md(doc, page_index)
+    finally:
+        doc.close()
+
+
+def page_tables_md(doc, page_index: int) -> List[str]:
     """find_tables только по требованию и только выше штампа: иначе рамка
     и штамп склеиваются со спецификацией в одну таблицу на весь лист."""
-    doc = fitz.open(stream=pdf, filetype="pdf")
     out: List[str] = []
     try:
         page = doc[max(0, min(page_index, len(doc) - 1))]
-        lines, _ = page_lines(page)
-        top = _stamp_top(page, lines, parse_stamp(page, lines)["code"])
-        clip = None
-        if top is not None and top > page.rect.y0 + 20:
-            pr = page.rect
-            clip = fitz.Rect(pr.x0, pr.y0, pr.x1, top) * page.derotation_matrix
-        tabs = list(getattr(_find_tables(page, clip), "tables", []) or [])
-        if not tabs and clip is not None:
-            tabs = list(getattr(_find_tables(page, None), "tables", []) or [])
+        tabs, skipped = find_page_tables(page)
+        if skipped:
+            log.info("стр.%s: empty_grid_skipped", page_index + 1)
         for t in tabs:
             if int(getattr(t, "row_count", 0) or 0) < TABLE_MIN_ROWS:
                 continue
@@ -658,58 +699,80 @@ def sheet_tables(pdf: bytes, page_index: int) -> List[str]:
                 break
     except Exception as e:
         log.warning("find_tables стр.%s: %r", page_index + 1, e)
-    finally:
-        doc.close()
     return out
 
 
 # ======================================================================
 # сборка проекта
 # ======================================================================
-def build_project(sources: Sequence[SourcePdf], opts: RenderOpts = RenderOpts()
-                  ) -> Project:
-    srcs = [s.with_sha() for s in sources]
+def build_sheets(doc, name: str, sha: str, pages: Sequence[int],
+                 opts: RenderOpts = RenderOpts()) -> List[Sheet]:
+    """Разбор заданных страниц открытого документа. sid здесь временный (L{page+1});
+    окончательную нумерацию L{n} проставляет finalize_project после склейки чанков."""
+    total = len(doc)
+    out: List[Sheet] = []
+    for pi in pages:
+        page = doc[pi]
+        pr = page.rect
+        lines, text = page_lines(page)
+        good = _text_ok(text)
+        if not good:
+            lines, text = [], ""
+        st = parse_stamp(page, lines)
+        hl = _headline(page, lines)
+        cols, rows, ppm, _ = plan_sheet(pr.width / MM, pr.height / MM, opts)
+        sh = Sheet(
+            sid=f"L{pi + 1}", file=name, file_sha=sha, page=pi,
+            pages_total=total, fmt=fmt_name(pr.width, pr.height),
+            is_scan=not good, frames=cols * rows, ppm=ppm,
+            code=st["code"], section=st["section"], sheet_no=st["sheet_no"],
+            sheets_total=st["sheets_total"], stage=st["stage"],
+            obj=st["obj"], title=st["title"],
+            title_src="stamp" if st["title"] else "",
+            headline=hl, stamp_raw=st["stamp_raw"],
+            notes=_notes(text), text=text[:TEXT_CAP], text_len=len(text),
+            **_entities(text))
+        sh.kind = _classify(sh, hl)
+        if not sh.title and hl:
+            sh.title, sh.title_src = hl, "headline"
+        out.append(sh)
+    return out
+
+
+def finalize_project(srcs: Sequence[SourcePdf], parts: Sequence[Sequence[Sheet]],
+                     totals: Sequence[int]) -> Project:
+    """Склейка: parts[i] — листы файла srcs[i] в порядке страниц, totals[i] — число
+    страниц. Нумерация L{n} сквозная, затем наследование/дубли/предупреждения."""
     pid = sha16("|".join(sorted(s.sha for s in srcs)).encode())
     sheets: List[Sheet] = []
     files: List[Tuple[str, str, int]] = []
     n = 0
-    for s in srcs:
-        doc = fitz.open(stream=s.data, filetype="pdf")           # один раз на файл
-        try:
-            total = len(doc)
-            files.append((s.name, s.sha, total))
-            for pi in range(total):
-                page = doc[pi]
-                pr = page.rect
-                lines, text = page_lines(page)
-                good = _text_ok(text)
-                if not good:
-                    lines, text = [], ""
-                st = parse_stamp(page, lines)
-                hl = _headline(page, lines)
-                cols, rows, ppm, _ = plan_sheet(pr.width / MM, pr.height / MM, opts)
-                n += 1
-                sh = Sheet(
-                    sid=f"L{n}", file=s.name, file_sha=s.sha, page=pi,
-                    pages_total=total, fmt=fmt_name(pr.width, pr.height),
-                    is_scan=not good, frames=cols * rows, ppm=ppm,
-                    code=st["code"], section=st["section"], sheet_no=st["sheet_no"],
-                    sheets_total=st["sheets_total"], stage=st["stage"],
-                    obj=st["obj"], title=st["title"],
-                    title_src="stamp" if st["title"] else "",
-                    headline=hl, stamp_raw=st["stamp_raw"],
-                    notes=_notes(text), text=text[:TEXT_CAP], text_len=len(text),
-                    **_entities(text))
-                sh.kind = _classify(sh, hl)
-                if not sh.title and hl:
-                    sh.title, sh.title_src = hl, "headline"
-                sheets.append(sh)
-        finally:
-            doc.close()
+    for s, part, total in zip(srcs, parts, totals):
+        files.append((s.name, s.sha, total))
+        for sh in sorted(part, key=lambda x: x.page):
+            n += 1
+            sh.sid = f"L{n}"
+            sheets.append(sh)
     _inherit_titles(sheets)
     _mark_dups(sheets)
     return Project(pid=pid, sheets=sheets, files=files,
                    warnings=_warnings(sheets))
+
+
+def build_project(sources: Sequence[SourcePdf], opts: RenderOpts = RenderOpts()
+                  ) -> Project:
+    """Последовательная сборка (CLI/тесты). Параллельная — workers.build_project_parallel."""
+    srcs = [s.with_sha() for s in sources]
+    parts: List[List[Sheet]] = []
+    totals: List[int] = []
+    for s in srcs:
+        doc = fitz.open(stream=s.data, filetype="pdf")           # один раз на файл
+        try:
+            totals.append(len(doc))
+            parts.append(build_sheets(doc, s.name, s.sha, range(len(doc)), opts))
+        finally:
+            doc.close()
+    return finalize_project(srcs, parts, totals)
 
 
 def _inherit_titles(sheets: List[Sheet]) -> None:

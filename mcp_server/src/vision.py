@@ -5,7 +5,7 @@ import asyncio
 import base64
 import logging
 import os
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import httpx
 
@@ -16,7 +16,16 @@ MODEL = os.getenv("VISION_MODEL", "google/gemini-3.1-pro-preview")   # свер�
 KEY = os.getenv("OPENROUTER_API_KEY", "")
 MAX_TOKENS = int(os.getenv("VISION_MAX_TOKENS", "12000"))
 TIMEOUT = float(os.getenv("VISION_TIMEOUT", "300"))
-_sem = asyncio.Semaphore(int(os.getenv("VISION_CONCURRENCY", "3")))
+_sem = asyncio.Semaphore(int(os.getenv("VISION_CONCURRENCY", "4")))
+_http: Optional[httpx.AsyncClient] = None
+
+
+def _client() -> httpx.AsyncClient:
+    """Один клиент на процесс (keep-alive); trust_env по умолчанию -> прокси из окружения."""
+    global _http
+    if _http is None or _http.is_closed:
+        _http = httpx.AsyncClient(timeout=TIMEOUT)
+    return _http
 
 SYSTEM = """Ты — инженер, читающий чертежи раздела ОВ (отопление, вентиляция, противодымная вентиляция).
 Тебе дают изображения ОДНОГО листа PDF (обзор и кадры высокой чёткости) и конкретный вопрос.
@@ -39,8 +48,15 @@ SYSTEM = """Ты — инженер, читающий чертежи разде�
 
 
 async def ask(question: str, meta: str, images: List[Tuple[str, bytes]]) -> str:
+    """Совместимая обёртка: только текст ответа."""
+    return (await ask_ex(question, meta, images))[0]
+
+
+async def ask_ex(question: str, meta: str, images: List[Tuple[str, bytes]]
+                 ) -> Tuple[str, Dict[str, int]]:
+    """-> (текст, usage). usage: {"prompt_tokens", "completion_tokens"} или {}."""
     if not KEY:
-        return "ОШИБКА: OPENROUTER_API_KEY не задан"
+        return "ОШИБКА: OPENROUTER_API_KEY не задан", {}
     content = [{"type": "text", "text": f"{meta}\n\nВОПРОС:\n{question}\n\n"
                                         "Далее изображения; перед каждым — подпись кадра."}]
     for cap, jpg in images:
@@ -57,21 +73,26 @@ async def ask(question: str, meta: str, images: List[Tuple[str, bytes]]) -> str:
     async with _sem:
         for attempt in range(3):
             try:
-                async with httpx.AsyncClient(timeout=TIMEOUT) as c:     # trust_env -> VPN-прокси
-                    r = await c.post(OR_URL, headers=headers, json=body)
+                c = _client()
+                r = await c.post(OR_URL, headers=headers, json=body)
                 if r.status_code in (408, 429, 500, 502, 503, 504):
                     last = f"HTTP {r.status_code}: {r.text[:300]}"
                     await asyncio.sleep(6 * (attempt + 1))
                     continue
                 r.raise_for_status()
-                msg = r.json()["choices"][0]["message"]
+                data = r.json()
+                msg = data["choices"][0]["message"]
                 txt = msg.get("content")
                 if isinstance(txt, list):
                     txt = "".join(p.get("text", "") for p in txt if isinstance(p, dict))
-                return (txt or "").strip() or "ОШИБКА: пустой ответ визуальной модели"
+                u = data.get("usage") or {}
+                usage = {"prompt_tokens": int(u.get("prompt_tokens") or 0),
+                         "completion_tokens": int(u.get("completion_tokens") or 0)}
+                return (txt or "").strip() or "ОШИБКА: пустой ответ визуальной модели", usage
             except httpx.HTTPStatusError as e:
-                return f"ОШИБКА визуальной модели: HTTP {e.response.status_code}: {e.response.text[:300]}"
+                return (f"ОШИБКА визуальной модели: HTTP {e.response.status_code}: "
+                        f"{e.response.text[:300]}"), {}
             except (httpx.RequestError, KeyError, IndexError, ValueError) as e:
                 last = repr(e)
                 await asyncio.sleep(6 * (attempt + 1))
-    return f"ОШИБКА визуальной модели после 3 попыток: {last}"
+    return f"ОШИБКА визуальной модели после 3 попыток: {last}", {}

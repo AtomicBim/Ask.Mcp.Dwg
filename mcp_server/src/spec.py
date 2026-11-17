@@ -27,8 +27,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import pymupdf as fitz
 
-from ingest import (KIND_SPEC, Project, Sheet, SourcePdf, build_project, page_lines,
-                    parse_stamp, _find_tables, _numkey, _stamp_top)
+from ingest import (KIND_SPEC, Project, Sheet, SourcePdf, build_project,
+                    find_page_tables, _numkey)
 
 log = logging.getLogger("spec")
 
@@ -145,17 +145,10 @@ def _map_header(cells: List[list]) -> Tuple[Optional[Dict[str, int]], int]:
     return None, 0
 
 
-def _page_tables(page) -> List[List[list]]:
-    """Таблицы только выше штампа (иначе find_tables склеивает рамку и штамп)."""
-    lines, _ = page_lines(page)
-    top = _stamp_top(page, lines, parse_stamp(page, lines)["code"])
-    pr = page.rect
-    clip = None
-    if top is not None and top > pr.y0 + 20:
-        clip = fitz.Rect(pr.x0, pr.y0, pr.x1, top) * page.derotation_matrix
-    tabs = list(getattr(_find_tables(page, clip), "tables", []) or [])
-    if not tabs and clip is not None:
-        tabs = list(getattr(_find_tables(page, None), "tables", []) or [])
+def _page_tables(page) -> Tuple[List[List[list]], bool]:
+    """Таблицы только выше штампа (иначе find_tables склеивает рамку и штамп).
+    -> (таблицы, empty_grid_skipped): пустой бланк отсекается префильтром."""
+    tabs, skipped = find_page_tables(page)
     out: List[List[list]] = []
     for t in sorted(tabs, key=lambda t: (round(t.bbox[1]), t.bbox[0])):
         if (t.col_count or 0) < 4 or (t.row_count or 0) < 2:
@@ -164,14 +157,47 @@ def _page_tables(page) -> List[List[list]]:
             out.append(t.extract() or [])
         except Exception as e:
             log.warning("стр.%s: extract: %r", page.number + 1, e)
-    return out
+    return out, skipped
+
+
+def page_tables_cells(doc, page_index: int) -> Tuple[List[List[list]], bool]:
+    """Для воркера: ячейки таблиц страницы (picklable) + флаг пропуска пустого бланка."""
+    try:
+        return _page_tables(doc[page_index])
+    except Exception as e:
+        log.warning("стр.%s: %r", page_index + 1, e)
+        return [], False
 
 
 # ----------------------------------------------------------------------
+TablesBySid = Dict[str, Tuple[List[List[list]], bool]]
+
+
+def spec_sheets(pr: Project) -> List[Sheet]:
+    """Листы СО, не сканы: только их таблицы нужно извлекать."""
+    return [sh for sh in pr.sheets if sh.kind == KIND_SPEC and not sh.is_scan]
+
+
 def build_spec(pr: Project, pdf: bytes) -> SpecResult:
+    """Последовательная сборка (CLI/эталон). Параллельная — workers.build_spec_parallel."""
     t0 = time.monotonic()
+    tabs: TablesBySid = {}
+    doc = fitz.open(stream=pdf, filetype="pdf")
+    try:
+        for sh in spec_sheets(pr):
+            tabs[sh.sid] = page_tables_cells(doc, sh.page)
+    finally:
+        doc.close()
+    return assemble_spec(pr, tabs, t0)
+
+
+def assemble_spec(pr: Project, tables_by_sid: TablesBySid,
+                  t0: Optional[float] = None) -> SpecResult:
+    """Свёртка (последовательная): шапки, система/группа, перенос через лист."""
+    if t0 is None:
+        t0 = time.monotonic()
     rep: Dict[str, List[str]] = {"сканы": [], "без таблицы": [], "графы не распознаны": [],
-                                 "шапка взята с предыдущего листа": []}
+                                 "шапка взята с предыдущего листа": [], "пустые бланки": []}
     by_code: "OrderedDict[str, List[Sheet]]" = OrderedDict()
     for sh in pr.sheets:
         if sh.kind == KIND_SPEC:
@@ -180,8 +206,7 @@ def build_spec(pr: Project, pdf: bytes) -> SpecResult:
     rows: List[SpecRow] = []
     docs: Dict[str, Tuple[str, str, str, str]] = {}
     systems: List[str] = []
-    doc = fitz.open(stream=pdf, filetype="pdf")
-    try:
+    if by_code:
         for code, g in by_code.items():
             g.sort(key=lambda s: (_numkey(s.sheet_no), s.page))
             docs[code] = (g[0].sheet_no, g[-1].sheet_no, g[0].sid, g[-1].sid)
@@ -193,13 +218,9 @@ def build_spec(pr: Project, pdf: bytes) -> SpecResult:
                 if sh.is_scan:
                     rep["сканы"].append(sh.sid)
                     continue
-                try:
-                    tables = _page_tables(doc[sh.page])
-                except Exception as e:
-                    log.warning("%s: %r", sh.sid, e)
-                    tables = []
+                tables, skipped = tables_by_sid.get(sh.sid, ([], False))
                 if not tables:
-                    rep["без таблицы"].append(sh.sid)
+                    rep["пустые бланки" if skipped else "без таблицы"].append(sh.sid)
                     continue
                 k = 0
                 for cells in tables:
@@ -266,8 +287,6 @@ def build_spec(pr: Project, pdf: bytes) -> SpecResult:
                             row.flags.append("нет наименования")
                         rows.append(row)
                         prev = row
-    finally:
-        doc.close()
     rep = {k: v for k, v in rep.items() if v}
     return SpecResult(rows=rows, docs=docs, systems=systems, report=rep,
                       seconds=round(time.monotonic() - t0, 1))

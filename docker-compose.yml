@@ -18,6 +18,8 @@ services:
     environment:
       <<: *proxy-env
       DATA_DIR: /data
+    mem_limit: 4g                  # воркеры PyMuPDF держат открытые PDF (WORKER_DOC_LRU на процесс)
+    shm_size: "256m"
     volumes:
       - dwg_data:/data
     ports:

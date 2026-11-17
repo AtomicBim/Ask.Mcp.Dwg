@@ -16,6 +16,11 @@ def _p(rel: str) -> str:
     return full
 
 
+def path(rel: str) -> str:
+    """Абсолютный путь файла кэша (для воркеров, открывающих PDF без пиклинга bytes)."""
+    return os.path.join(DATA, rel)
+
+
 def exists(rel: str) -> bool:
     return os.path.exists(os.path.join(DATA, rel))
 

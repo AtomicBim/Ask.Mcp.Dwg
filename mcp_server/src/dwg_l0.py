@@ -45,6 +45,7 @@ except Exception:
 __all__ = [
     "MM", "PX_PER_MM", "MAX_IMG_PX", "RenderOpts", "Tile", "SheetRender",
     "fmt_name", "plan_sheet", "render_sheet", "render_region", "render_overview",
+    "render_sheet_doc", "render_region_doc",
     "render_map", "sha16", "page_geometry",
 ]
 
@@ -359,38 +360,62 @@ def render_overview(pdf: bytes, page_index: int, opts: RenderOpts = RenderOpts()
         doc.close()
 
 
+def render_sheet_doc(doc, page_index: int, sid: str = "L1",
+                     opts: RenderOpts = RenderOpts()) -> SheetRender:
+    """render_sheet на уже открытом документе (воркеры держат его открытым)."""
+    page = doc[max(0, min(page_index, len(doc) - 1))]
+    pr = page.rect
+    notes: List[str] = []
+    scan = _is_scan(page)
+    cols, rows, ppm, single = plan_sheet(pr.width / MM, pr.height / MM, opts)
+    if scan:
+        nd = _native_dpi(page)
+        if opts.native_cap and nd >= 72 and _dpi(ppm) > nd * 1.15:
+            ppm = max(2.0, nd * 1.15 / 25.4)
+            notes.append(f"скан: плотность ограничена нативной ~{nd} dpi")
+        else:
+            notes.append("скан без текстового слоя")
+    if single and ppm < opts.px_per_mm - 0.05:
+        notes.append(f"один кадр при {ppm} px/мм вместо {opts.px_per_mm}")
+    if page.rotation:
+        notes.append(f"лист повёрнут на {page.rotation}°")
+    ink = _Ink(page)
+    tiles, skipped = _tiles(page, pr, ink, ppm, cols, rows, opts, sid, scan)
+    side = max(pr.width, pr.height) or 1.0
+    ov_dpi = int(max(72, min(DPI_HARD_CAP, 2 * opts.overview_px * 72.0 / side)))
+    ov, ow, oh, _ = _raster(page, pr, ov_dpi, OVERVIEW_Q,
+                            max_side=opts.overview_px, sharpen=True)
+    return SheetRender(sid=sid, page=page.number,
+                       fmt=fmt_name(pr.width, pr.height), ppm=ppm, single=single,
+                       overview=ov, overview_px=(ow, oh), tiles=tiles,
+                       skipped=skipped, notes=tuple(notes))
+
+
 def render_sheet(pdf: bytes, page_index: int, sid: str = "L1",
                  opts: RenderOpts = RenderOpts()) -> SheetRender:
     doc = fitz.open(stream=pdf, filetype="pdf")
     try:
-        page = doc[max(0, min(page_index, len(doc) - 1))]
-        pr = page.rect
-        notes: List[str] = []
-        scan = _is_scan(page)
-        cols, rows, ppm, single = plan_sheet(pr.width / MM, pr.height / MM, opts)
-        if scan:
-            nd = _native_dpi(page)
-            if opts.native_cap and nd >= 72 and _dpi(ppm) > nd * 1.15:
-                ppm = max(2.0, nd * 1.15 / 25.4)
-                notes.append(f"скан: плотность ограничена нативной ~{nd} dpi")
-            else:
-                notes.append("скан без текстового слоя")
-        if single and ppm < opts.px_per_mm - 0.05:
-            notes.append(f"один кадр при {ppm} px/мм вместо {opts.px_per_mm}")
-        if page.rotation:
-            notes.append(f"лист повёрнут на {page.rotation}°")
-        ink = _Ink(page)
-        tiles, skipped = _tiles(page, pr, ink, ppm, cols, rows, opts, sid, scan)
-        side = max(pr.width, pr.height) or 1.0
-        ov_dpi = int(max(72, min(DPI_HARD_CAP, 2 * opts.overview_px * 72.0 / side)))
-        ov, ow, oh, _ = _raster(page, pr, ov_dpi, OVERVIEW_Q,
-                                max_side=opts.overview_px, sharpen=True)
-        return SheetRender(sid=sid, page=page.number,
-                           fmt=fmt_name(pr.width, pr.height), ppm=ppm, single=single,
-                           overview=ov, overview_px=(ow, oh), tiles=tiles,
-                           skipped=skipped, notes=tuple(notes))
+        return render_sheet_doc(doc, page_index, sid, opts)
     finally:
         doc.close()
+
+
+def render_region_doc(doc, page_index: int, box: Box, sid: str = "L1",
+                      opts: RenderOpts = RenderOpts(), zoom: float = 2.0
+                      ) -> Tuple[Tile, ...]:
+    """Доразглядывание на открытом документе: плотность в zoom раз выше."""
+    page = doc[max(0, min(page_index, len(doc) - 1))]
+    area = _rect(box, page.rect)
+    if not area.is_valid or area.width < 8 or area.height < 8:
+        return ()
+    o = RenderOpts(px_per_mm=opts.px_per_mm * max(1.0, zoom),
+                   max_img_px=opts.max_img_px, tile_q=opts.tile_q,
+                   overview_px=opts.overview_px, tile_text=opts.tile_text,
+                   native_cap=opts.native_cap)
+    cols, rows, ppm, _ = plan_sheet(area.width / MM, area.height / MM, o)
+    ink = _Ink(page)
+    return _tiles(page, area, ink, ppm, cols, rows, o, f"{sid}Z",
+                  _is_scan(page))[0]
 
 
 def render_region(pdf: bytes, page_index: int, box: Box, sid: str = "L1",
@@ -399,18 +424,7 @@ def render_region(pdf: bytes, page_index: int, box: Box, sid: str = "L1",
     """Доразглядывание: плотность в zoom раз выше, тот же принцип деления."""
     doc = fitz.open(stream=pdf, filetype="pdf")
     try:
-        page = doc[max(0, min(page_index, len(doc) - 1))]
-        area = _rect(box, page.rect)
-        if not area.is_valid or area.width < 8 or area.height < 8:
-            return ()
-        o = RenderOpts(px_per_mm=opts.px_per_mm * max(1.0, zoom),
-                       max_img_px=opts.max_img_px, tile_q=opts.tile_q,
-                       overview_px=opts.overview_px, tile_text=opts.tile_text,
-                       native_cap=opts.native_cap)
-        cols, rows, ppm, _ = plan_sheet(area.width / MM, area.height / MM, o)
-        ink = _Ink(page)
-        return _tiles(page, area, ink, ppm, cols, rows, o, f"{sid}Z",
-                      _is_scan(page))[0]
+        return render_region_doc(doc, page_index, box, sid, opts, zoom)
     finally:
         doc.close()
 
