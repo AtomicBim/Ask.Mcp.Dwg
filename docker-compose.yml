@@ -1,0 +1,33 @@
+x-proxy-env: &proxy-env
+  HTTP_PROXY: http://host.docker.internal:20172
+  HTTPS_PROXY: http://host.docker.internal:20172
+  NO_PROXY: localhost,127.0.0.1,open-webui,mcp-dwg-server
+
+x-extra-hosts: &extra-hosts
+  - "host.docker.internal:172.18.0.1"
+
+services:
+  mcp-dwg-server:
+    build:
+      context: ./mcp_server
+    container_name: mcp-dwg-server
+    restart: unless-stopped
+    env_file:
+      - .env
+    extra_hosts: *extra-hosts
+    environment:
+      <<: *proxy-env
+      DATA_DIR: /data
+    volumes:
+      - dwg_data:/data
+    ports:
+      - "127.0.0.1:8002:8000"      # только для локальных тестов; OWUI ходит по сети ai_network
+    networks:
+      - ai_network
+
+networks:
+  ai_network:
+    external: true
+
+volumes:
+  dwg_data:
